@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package kv;
+
+// Raft consensus RPCs
+service Raft {
+  // RequestVote RPC
+  rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
+  // AppendEntries RPC (heartbeats and log replication)
+  rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+}
+
+// Client-facing Key-Value RPCs
+service KV {
+  rpc Put(PutRequest) returns (PutReply);
+  rpc Get(GetRequest) returns (GetReply);
+  rpc Delete(DeleteRequest) returns (DeleteReply);
+}
+
+// Raft: RequestVote arguments
+message RequestVoteArgs {
+  int32 term = 1;
+  int32 candidateId = 2;
+  int64 lastLogIndex = 3;
+  int64 lastLogTerm = 4;
+}
+
+// Raft: RequestVote reply
+message RequestVoteReply {
+  int32 term = 1;
+  bool voteGranted = 2;
+}
+
+// Raft: AppendEntries arguments
+message AppendEntriesArgs {
+  int32 term = 1;
+  int32 leaderId = 2;
+  int64 prevLogIndex = 3;
+  int64 prevLogTerm = 4;
+  repeated LogEntry entries = 5;
+  int64 leaderCommit = 6;
+}
+
+// Raft: AppendEntries reply
+message AppendEntriesReply {
+  int32 term = 1;
+  bool success = 2;
+}
+
+// Log entry for Raft replication
+message LogEntry {
+  int64 term = 1;
+  int64 index = 2;
+  string command = 3;
+}
+
+// KV: Put request
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
+
+// KV: Put reply
+message PutReply {
+  bool success = 1;
+}
+
+// KV: Get request
+message GetRequest {
+  string key = 1;
+}
+
+// KV: Get reply
+message GetReply {
+  bool found = 1;
+  string value = 2;
+}
+
+// KV: Delete request
+message DeleteRequest {
+  string key = 1;
+}
+
+// KV: Delete reply
+message DeleteReply {
+  bool success = 1;
+}
