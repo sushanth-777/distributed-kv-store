@@ -1,6 +1,6 @@
 #pragma once
-
 #include <vector>
+#include <functional>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
@@ -17,6 +17,13 @@ struct LogEntry {
 
 class RaftNode {
 public:
+    using RequestVoteFn =
+      std::function<bool(int peerId,
+                         int candidateTerm,
+                         int candidateId,
+                         int lastLogIndex,
+                         int lastLogTerm)>;
+
     RaftNode(int id, const std::vector<int>& peerIds);
     ~RaftNode();
 
@@ -32,6 +39,10 @@ public:
                              int prevLogIndex, int prevLogTerm,
                              const std::vector<LogEntry>& entries,
                              int leaderCommit);
+
+    // let the caller provide a function that actually sends a
+    // RequestVote RPC to peerId
+    void setRequestVoteCallback(RequestVoteFn fn);
 
 private:
     void runElectionTimer();
@@ -49,6 +60,9 @@ private:
     int votedFor;
     int commitIndex;
     int lastApplied;
+
+    // holds the user‐supplied RPC stub
+    RequestVoteFn requestVoteRpc;
 
     // Election timeout and heartbeat interval
     std::chrono::milliseconds electionTimeout;

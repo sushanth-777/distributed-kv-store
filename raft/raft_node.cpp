@@ -1,6 +1,8 @@
 #include "raft_node.h"
 #include <thread>
 #include <random>
+#include <mutex>
+#include <condition_variable>
 
 RaftNode::RaftNode(int id, const std::vector<int>& peerIds)
     : nodeId(id), peers(peerIds), state(RaftState::Follower),
@@ -30,8 +32,41 @@ void RaftNode::shutdown() {
 
 bool RaftNode::handleRequestVote(int candidateTerm, int candidateId,
                                   int lastLogIndex, int lastLogTerm) {
-    // TODO: implement vote granting logic
-    return false;
+    // Implement vote granting logic
+
+    std::lock_guard<std::mutex> lock(mtx);
+
+    // 1. Reply FALSE if candidate's term < ours
+    if(candidateTerm < currentTerm){
+        return false;
+    }
+
+    // 2. If Candidate Term > currentTerm, update term to latest and convert it to follower
+    if(candidateTerm > currentTerm){
+        becomeFollower(candidateTerm);
+    }
+
+    // 3, Check if we have already voted for this term
+    if(votedFor != -1 && votedFor != candidateId){
+        return false;
+    }
+
+    // 4. Check candidate's log up-to-date
+    const LogEntry &lastEntry = log.back();
+    int myLastTerm = lastEntry.term;
+    int myLastIndex = lastEntry.index;
+
+    bool logOk = (lastLogTerm > myLastTerm) || (lastLogTerm == myLastTerm && lastLogIndex >= myLastIndex);
+    if(!logOk){
+        return false;
+    }
+
+    // 5. Grant Vote
+    votedFor = candidateId;
+
+    // Reset election timer
+    cv.notify_all();
+    return true;
 }
 
 bool RaftNode::handleAppendEntries(int leaderTerm, int leaderId,
