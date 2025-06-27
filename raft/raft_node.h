@@ -97,7 +97,7 @@ private:
     std::chrono::milliseconds electionTimeout;
     std::chrono::milliseconds heartbeatInterval;
 
-    std::mutex mtx;
+    // std::mutex mtx;
     std::condition_variable cv;
     bool running;
 };
