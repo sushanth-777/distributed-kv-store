@@ -8,6 +8,9 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <sstream>           // for parsing command strings
+
+#include "kv_store.h"        // your in-memory KV store
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -74,10 +77,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Parse node ID
+  // Parse this node's ID
   int myId = std::stoi(argv[1]);
 
-  // Parse peers
+  // Parse peers: each arg "peerId:host:port"
   std::vector<int> peerIds;
   std::vector<std::string> peerAddrs;
   for (int i = 2; i < argc; ++i) {
@@ -87,10 +90,24 @@ int main(int argc, char** argv) {
     peerAddrs.push_back(spec.substr(colon + 1));
   }
 
-  // 1) Create RaftNode
+  // 1) Create the Raft node
   RaftNode node(myId, peerIds);
 
-  // 2) Build gRPC stubs for each peer
+  // 2) Create the in-memory KV store and hook up apply-callback
+  KVStore kv;
+  node.setApplyCallback([&kv](const LogEntry& entry) {
+    std::istringstream iss(entry.command);
+    std::string op, key, val;
+    iss >> op >> key;
+    if (op == "put" && (iss >> val)) {
+      kv.put(key, val);
+    } else if (op == "del") {
+      kv.del(key);
+    }
+    // ignore any unknown commands
+  });
+
+  // 3) Build gRPC stubs for talking to peers
   std::unordered_map<int, std::unique_ptr<Raft::Stub>> stubs;
   for (size_t i = 0; i < peerIds.size(); ++i) {
     stubs[peerIds[i]] = Raft::NewStub(
@@ -99,7 +116,7 @@ int main(int argc, char** argv) {
     );
   }
 
-  // 3a) Wire up outgoing RequestVote
+  // 4a) Wire up outgoing RequestVote RPCs
   node.setRequestVoteCallback(
     [&stubs](int peer,
              int term,
@@ -124,21 +141,21 @@ int main(int argc, char** argv) {
     }
   );
 
-  // 3b) Wire up AppendEntries RPC
+  // 4b) Wire up outgoing AppendEntries RPCs
   node.setAppendEntriesCallback(
     [&stubs](int peer,
-            int term,
-            int leaderId,
-            int prevLogIndex,
-            int prevLogTerm,
-            const std::vector<LogEntry>& entries,
-            int leaderCommit) -> bool {
+             int term,
+             int leaderId,
+             int prevLogIndex,
+             int prevLogTerm,
+             const std::vector<LogEntry>& entries,
+             int leaderCommit) -> bool {
       AppendEntriesRequest req;
       req.set_term(term);
       req.set_leaderid(leaderId);
       req.set_prevlogindex(prevLogIndex);
       req.set_prevlogterm(prevLogTerm);
-      for (auto& e : entries) {
+      for (const auto& e : entries) {
         auto* pe = req.add_entries();
         pe->set_term(e.term);
         pe->set_index(e.index);
@@ -149,15 +166,14 @@ int main(int argc, char** argv) {
       AppendEntriesReply resp;
       grpc::ClientContext ctx;
       auto status = stubs[peer]->AppendEntries(&ctx, req, &resp);
-      if (!status.ok()) return false;
-      return resp.success();
+      return status.ok() && resp.success();
     }
   );
 
-  // 4) Start Raft’s election timer
+  // 5) Start Raft’s election timer (and, upon election, heartbeats)
   node.start();
 
-  // 5) Start the gRPC server
+  // 6) Launch the gRPC server to accept incoming Raft RPCs
   RaftServiceImpl service(node);
   ServerBuilder builder;
   std::string listenAddr = "0.0.0.0:" + std::to_string(50050 + myId);

@@ -33,7 +33,9 @@ public:
                        const std::vector<LogEntry>& entries,
                        int leaderCommit)>;
     
-    
+    // callback to apply committed entries to the state machine
+    using ApplyFn =
+    std::function<void(const LogEntry& entry)>;
 
 
     RaftNode(int id, const std::vector<int>& peerIds);
@@ -61,6 +63,9 @@ public:
       std::lock_guard<std::mutex> lock(mtx);
       appendEntriesRpc = std::move(fn);
     }
+
+    // register the apply‐entry callback
+    void setApplyCallback(ApplyFn fn);
 
     // Thread-safe accessor for currentTerm
     int getCurrentTerm() const {
@@ -92,6 +97,9 @@ private:
 
     // add a member to hold the callback:
     AppendEntriesFn appendEntriesRpc;
+
+    // user‐supplied apply‐callback
+    ApplyFn applyCb;
 
     // Election timeout and heartbeat interval
     std::chrono::milliseconds electionTimeout;

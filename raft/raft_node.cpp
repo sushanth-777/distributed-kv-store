@@ -120,9 +120,14 @@ bool RaftNode::handleAppendEntries(int leaderTerm, int leaderId,
     }
 
     // 6) Update commitIndex
-    int lastNewIndex = prevLogIndex + static_cast<int>(entries.size());
+    int lastNewIndex = prevLogIndex + entries.size();
     if (leaderCommit > commitIndex) {
         commitIndex = std::min(leaderCommit, lastNewIndex);
+        // Apply all newly committed entries
+        while (lastApplied < commitIndex) {
+            lastApplied++;
+            if (applyCb) applyCb(log[lastApplied]);
+        }
     }
 
     return true;
@@ -143,51 +148,76 @@ void RaftNode::runElectionTimer() {
 }
 
 void RaftNode::startElection() {
-    // 1) Become candidate in a new term
+    int lastIndex, lastTerm;
+    int voteCount = 1;  // we always vote for ourselves
+
+    // 1) Become Candidate in a new term
     {
         std::lock_guard<std::mutex> lock(mtx);
         currentTerm++;
         state = RaftState::Candidate;
-        votedFor = nodeId;      // vote for self
-        cv.notify_all();        // reset timer
+        votedFor = nodeId;
+        // reset the election timer
+        cv.notify_all();
+
+        // snapshot our log’s last index/term for the RPCs below
+        lastIndex = log.back().index;
+        lastTerm  = log.back().term;
     }
 
-    // 2) Tally votes
-    int lastIndex = log.back().index;
-    int lastTerm  = log.back().term;
-    int votes = 1;  // we already voted for ourselves
-
+    // 2) Send RequestVote RPCs to all peers
     for (int peer : peers) {
         bool granted = false;
-        // if the caller provided an RPC callback, use it
         {
             std::lock_guard<std::mutex> lock(mtx);
             if (requestVoteRpc) {
                 granted = requestVoteRpc(
-                  peer,
-                  currentTerm,
-                  nodeId,
-                  lastIndex,
-                  lastTerm
+                    peer,
+                    currentTerm,
+                    nodeId,
+                    lastIndex,
+                    lastTerm
                 );
             }
         }
-        if (granted) votes++;
+        if (granted) voteCount++;
     }
 
-    // 3) If majority, become Leader
+    // 3) If we have a majority, become Leader
     {
         std::lock_guard<std::mutex> lock(mtx);
-        if (state == RaftState::Candidate &&
-            votes > static_cast<int>(peers.size() + 1) / 2)
-        {
-            becomeLeader();
+        // majority = (N+1)/2 of total nodes including self
+        int majority = static_cast<int>(peers.size() + 1) / 2 + 1;
+        if (state == RaftState::Candidate && voteCount >= majority) {
+            // transition to Leader
+            state = RaftState::Leader;
+
+            // a) append a no-op entry at the head of our new leadership
+            int newIndex = log.back().index + 1;
+            log.push_back({ currentTerm, newIndex, "" });
+
+            // b) immediately commit that entry
+            commitIndex = newIndex;
+
+            // c) apply any newly committed entries
+            while (lastApplied < commitIndex) {
+                lastApplied++;
+                if (applyCb) {
+                    applyCb(log[lastApplied]);
+                }
+            }
+
+            // d) start heartbeats in the background
+            std::thread(&RaftNode::sendHeartbeats, this).detach();
         }
-        // Randomize next timeout to avoid livelock
-        electionTimeout =
-          std::chrono::milliseconds(150 + (std::rand() % 150));
+
+        // 4) Randomize next election timeout to avoid livelock
+        electionTimeout = std::chrono::milliseconds(
+            150 + (std::rand() % 150)
+        );
     }
 }
+
 
 
 void RaftNode::sendHeartbeats() {
@@ -233,3 +263,9 @@ void RaftNode::becomeFollower(int term) {
 void RaftNode::replicateLog() {
     // TODO: send log entries to followers
 }
+
+void RaftNode::setApplyCallback(ApplyFn fn) {
+    std::lock_guard<std::mutex> lock(mtx);
+    applyCb = std::move(fn);
+}
+
