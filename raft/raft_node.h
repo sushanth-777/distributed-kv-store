@@ -24,6 +24,18 @@ public:
                          int lastLogIndex,
                          int lastLogTerm)>;
 
+    using AppendEntriesFn =
+    std::function<bool(int peerId,
+                       int term,
+                       int leaderId,
+                       int prevLogIndex,
+                       int prevLogTerm,
+                       const std::vector<LogEntry>& entries,
+                       int leaderCommit)>;
+    
+    
+
+
     RaftNode(int id, const std::vector<int>& peerIds);
     ~RaftNode();
 
@@ -44,13 +56,27 @@ public:
     // RequestVote RPC to peerId
     void setRequestVoteCallback(RequestVoteFn fn);
 
+    // Let caller provide the RPC stub for AppendEntries
+    void setAppendEntriesCallback(AppendEntriesFn fn) {
+      std::lock_guard<std::mutex> lock(mtx);
+      appendEntriesRpc = std::move(fn);
+    }
+
+    // Thread-safe accessor for currentTerm
+    int getCurrentTerm() const {
+        std::lock_guard<std::mutex> lock(mtx);
+        return currentTerm;
+    }
+
 private:
+    mutable std::mutex mtx;
     void runElectionTimer();
     void sendHeartbeats();
     void becomeLeader();
     void becomeFollower(int term);
     void replicateLog();
-
+    // Election logic
+    void startElection();
     int nodeId;
     std::vector<int> peers;
     RaftState state;
@@ -63,6 +89,9 @@ private:
 
     // holds the user‐supplied RPC stub
     RequestVoteFn requestVoteRpc;
+
+    // add a member to hold the callback:
+    AppendEntriesFn appendEntriesRpc;
 
     // Election timeout and heartbeat interval
     std::chrono::milliseconds electionTimeout;

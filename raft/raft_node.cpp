@@ -9,7 +9,10 @@ RaftNode::RaftNode(int id, const std::vector<int>& peerIds)
       currentTerm(0), votedFor(-1), commitIndex(0), lastApplied(0),
       electionTimeout(150 + (rand() % 150)),  // ms
       heartbeatInterval(50), running(true) {
-    // Initialize with a dummy log entry at index 0
+   
+    // seed once (you can do this globally too)
+    std::srand((unsigned)std::time(nullptr));
+     // Initialize with a dummy log entry at index 0
     log.push_back({0, 0, ""});
 }
 
@@ -29,6 +32,12 @@ void RaftNode::shutdown() {
     }
     cv.notify_all();
 }
+
+void RaftNode::setRequestVoteCallback(RequestVoteFn fn) {
+    std::lock_guard<std::mutex> lock(mtx);
+    requestVoteRpc = std::move(fn);
+}
+
 
 bool RaftNode::handleRequestVote(int candidateTerm, int candidateId,
                                   int lastLogIndex, int lastLogTerm) {
@@ -73,27 +82,146 @@ bool RaftNode::handleAppendEntries(int leaderTerm, int leaderId,
                                     int prevLogIndex, int prevLogTerm,
                                     const std::vector<LogEntry>& entries,
                                     int leaderCommit) {
-    // TODO: implement log append & consistency check
-    return false;
+    // Implement log append & consistency check
+    std::lock_guard<std::mutex> lock(mtx);
+
+    // 1) Reply false if term < currentTerm
+    if (leaderTerm < currentTerm) {
+        return false;
+    }
+    // 2) If term > currentTerm, become follower
+    if (leaderTerm > currentTerm) {
+        becomeFollower(leaderTerm);
+    }
+    // 3) Reset election timer
+    cv.notify_all();
+
+    // 4) Check log consistency
+    if (prevLogIndex >= static_cast<int>(log.size()) ||
+        log[prevLogIndex].term != prevLogTerm) {
+        return false;
+    }
+
+    // 5) Append new entries, handling conflicts
+    int insertIdx = prevLogIndex + 1;
+    for (const auto& entry : entries) {
+        if (insertIdx < static_cast<int>(log.size())) {
+            // conflict?
+            if (log[insertIdx].term != entry.term) {
+                // delete the existing entry and all that follow
+                log.resize(insertIdx);
+                log.push_back(entry);
+            }
+        } else {
+            // no entry there yet → just append
+            log.push_back(entry);
+        }
+        insertIdx++;
+    }
+
+    // 6) Update commitIndex
+    int lastNewIndex = prevLogIndex + static_cast<int>(entries.size());
+    if (leaderCommit > commitIndex) {
+        commitIndex = std::min(leaderCommit, lastNewIndex);
+    }
+
+    return true;
 }
 
 void RaftNode::runElectionTimer() {
-    // TODO: wait for electionTimeout; if no heartbeat, start election
+    //wait for electionTimeout; if no heartbeat, start election
+    std::unique_lock<std::mutex> lock(mtx);
+
     while (running) {
-        std::unique_lock<std::mutex> lock(mtx);
         if (cv.wait_for(lock, electionTimeout) == std::cv_status::timeout) {
             // start election
+            lock.unlock();
+            startElection();
+            lock.lock();
         }
     }
 }
 
+void RaftNode::startElection() {
+    // 1) Become candidate in a new term
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        currentTerm++;
+        state = RaftState::Candidate;
+        votedFor = nodeId;      // vote for self
+        cv.notify_all();        // reset timer
+    }
+
+    // 2) Tally votes
+    int lastIndex = log.back().index;
+    int lastTerm  = log.back().term;
+    int votes = 1;  // we already voted for ourselves
+
+    for (int peer : peers) {
+        bool granted = false;
+        // if the caller provided an RPC callback, use it
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (requestVoteRpc) {
+                granted = requestVoteRpc(
+                  peer,
+                  currentTerm,
+                  nodeId,
+                  lastIndex,
+                  lastTerm
+                );
+            }
+        }
+        if (granted) votes++;
+    }
+
+    // 3) If majority, become Leader
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (state == RaftState::Candidate &&
+            votes > static_cast<int>(peers.size() + 1) / 2)
+        {
+            becomeLeader();
+        }
+        // Randomize next timeout to avoid livelock
+        electionTimeout =
+          std::chrono::milliseconds(150 + (std::rand() % 150));
+    }
+}
+
+
 void RaftNode::sendHeartbeats() {
-    // TODO: leader periodically sends AppendEntries with no entries
+    // Leader periodically sends AppendEntries with no entries
+    std::vector<LogEntry> empty;  // heartbeat has no new entries
+    while (state == RaftState::Leader && running) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            for (int peer : peers) {
+                if (appendEntriesRpc) {
+                    // always send prevLogIndex = last log index,
+                    // prevLogTerm = term of that entry
+                    int prevIndex = log.back().index;
+                    int prevTerm  = log.back().term;
+                    appendEntriesRpc(
+                      peer,
+                      currentTerm,
+                      nodeId,
+                      prevIndex,
+                      prevTerm,
+                      empty,
+                      commitIndex
+                    );
+                }
+            }
+        }
+        std::this_thread::sleep_for(heartbeatInterval);
+    }
 }
 
 void RaftNode::becomeLeader() {
     state = RaftState::Leader;
     // initialize leader state, nextIndex, matchIndex
+    std::thread(&RaftNode::sendHeartbeats, this).detach();
 }
 
 void RaftNode::becomeFollower(int term) {

@@ -1,11 +1,14 @@
-# Find protobuf & gRPC (already in top-level CMakeLists)
-find_package(Protobuf CONFIG REQUIRED)
-find_package(gRPC    CONFIG REQUIRED)
+find_package(Protobuf   CONFIG REQUIRED)
+find_package(gRPC        CONFIG REQUIRED)
 
-# If you have pre-generated sources (kv.pb.cc, kv.grpc.pb.cc), list them:
+# List the generated sources explicitly:
+set(RPC_SRCS
+    raft.pb.cc
+    raft.grpc.pb.cc
+)
+
 add_library(rpc STATIC
-    kv.grpc.pb.cc
-    kv.pb.cc            # if you committed this; otherwise generate from kv.proto
+    ${RPC_SRCS}
 )
 
 target_include_directories(rpc PUBLIC
