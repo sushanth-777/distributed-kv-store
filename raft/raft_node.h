@@ -67,11 +67,18 @@ public:
     // register the apply‐entry callback
     void setApplyCallback(ApplyFn fn);
 
+    // Thread-safe check for leader state
+    bool isLeader() const {
+      std::lock_guard<std::mutex> lock(mtx);
+      return state == RaftState::Leader;
+    }
+
     // Thread-safe accessor for currentTerm
     int getCurrentTerm() const {
         std::lock_guard<std::mutex> lock(mtx);
         return currentTerm;
     }
+
 
 private:
     mutable std::mutex mtx;

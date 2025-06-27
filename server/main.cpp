@@ -1,34 +1,46 @@
 #include <grpcpp/grpcpp.h>
-#include "raft.grpc.pb.h"
-#include "raft.pb.h"
+#include "kv.grpc.pb.h"
+#include "kv.pb.h"
 #include "raft_node.h"
+#include "kv_store.h"
 
 #include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <sstream>           // for parsing command strings
-
-#include "kv_store.h"        // your in-memory KV store
+#include <sstream>
 
 using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::Status;
 
-using raft::Raft;
-using raft::RequestVoteRequest;
-using raft::RequestVoteReply;
-using raft::AppendEntriesRequest;
-using raft::AppendEntriesReply;
+// Consensus RPCs (all defined in kv.proto under package kv)
+using kv::Raft;
+using kv::RequestVoteArgs;
+using kv::RequestVoteReply;
+using kv::AppendEntriesArgs;
+using kv::AppendEntriesReply;
 
+// Client-facing KV RPCs (defined in the same kv.proto)
+using kv::KV;
+using kv::PutRequest;
+using kv::PutReply;
+using kv::GetRequest;
+using kv::GetReply;
+using kv::DeleteRequest;
+using kv::DeleteReply;
+
+// ------------------------------------------------------------
+// RaftServiceImpl: forwards Raft RPCs into the RaftNode instance
+// ------------------------------------------------------------
 class RaftServiceImpl final : public Raft::Service {
 public:
   explicit RaftServiceImpl(RaftNode& node) : node_(node) {}
 
   Status RequestVote(ServerContext* /*ctx*/,
-                     const RequestVoteRequest* req,
+                     const RequestVoteArgs* req,
                      RequestVoteReply* resp) override {
     bool granted = node_.handleRequestVote(
       req->term(),
@@ -42,14 +54,19 @@ public:
   }
 
   Status AppendEntries(ServerContext* /*ctx*/,
-                       const AppendEntriesRequest* req,
+                       const AppendEntriesArgs* req,
                        AppendEntriesReply* resp) override {
-    // Convert protobuf LogEntry → your LogEntry struct
+    // Convert each protobuf LogEntry → our internal LogEntry
     std::vector<LogEntry> entries;
     entries.reserve(req->entries_size());
     for (int i = 0; i < req->entries_size(); ++i) {
       const auto& e = req->entries(i);
-      entries.push_back({ e.term(), e.index(), e.command() });
+      // <-- explicit LogEntry construction fixes the push_back error:
+      entries.push_back({
+        static_cast<int>(e.term()),
+        static_cast<int>(e.index()),
+        e.command()
+      });
     }
 
     bool success = node_.handleAppendEntries(
@@ -60,7 +77,6 @@ public:
       entries,
       req->leadercommit()
     );
-
     resp->set_term(node_.getCurrentTerm());
     resp->set_success(success);
     return Status::OK;
@@ -70,6 +86,56 @@ private:
   RaftNode& node_;
 };
 
+// ------------------------------------
+// KVServiceImpl: handles client requests
+// ------------------------------------
+class KVServiceImpl final : public KV::Service {
+public:
+  KVServiceImpl(RaftNode& node, KVStore& kv)
+    : node_(node), kv_(kv) {}
+
+  Status Put(ServerContext* /*ctx*/,
+             const PutRequest* req,
+             PutReply* resp) override {
+    // Only the leader accepts writes
+    if (!node_.isLeader()) {
+      resp->set_success(false);
+      return Status::OK;
+    }
+    kv_.put(req->key(), req->value());
+    resp->set_success(true);
+    return Status::OK;
+  }
+
+  Status Get(ServerContext* /*ctx*/,
+             const GetRequest* req,
+             GetReply* resp) override {
+    auto opt = kv_.get(req->key());
+    resp->set_found(opt.has_value());
+    if (opt) resp->set_value(*opt);
+    return Status::OK;
+  }
+
+  Status Delete(ServerContext* /*ctx*/,
+                const DeleteRequest* req,
+                DeleteReply* resp) override {
+    if (!node_.isLeader()) {
+      resp->set_success(false);
+      return Status::OK;
+    }
+    kv_.del(req->key());
+    resp->set_success(true);
+    return Status::OK;
+  }
+
+private:
+  RaftNode& node_;
+  KVStore&  kv_;
+};
+
+// -------------
+// Entry point
+// -------------
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::cerr << "Usage: " << argv[0]
@@ -77,10 +143,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Parse this node's ID
   int myId = std::stoi(argv[1]);
-
-  // Parse peers: each arg "peerId:host:port"
   std::vector<int> peerIds;
   std::vector<std::string> peerAddrs;
   for (int i = 2; i < argc; ++i) {
@@ -90,11 +153,9 @@ int main(int argc, char** argv) {
     peerAddrs.push_back(spec.substr(colon + 1));
   }
 
-  // 1) Create the Raft node
   RaftNode node(myId, peerIds);
-
-  // 2) Create the in-memory KV store and hook up apply-callback
   KVStore kv;
+
   node.setApplyCallback([&kv](const LogEntry& entry) {
     std::istringstream iss(entry.command);
     std::string op, key, val;
@@ -104,10 +165,8 @@ int main(int argc, char** argv) {
     } else if (op == "del") {
       kv.del(key);
     }
-    // ignore any unknown commands
   });
 
-  // 3) Build gRPC stubs for talking to peers
   std::unordered_map<int, std::unique_ptr<Raft::Stub>> stubs;
   for (size_t i = 0; i < peerIds.size(); ++i) {
     stubs[peerIds[i]] = Raft::NewStub(
@@ -116,41 +175,26 @@ int main(int argc, char** argv) {
     );
   }
 
-  // 4a) Wire up outgoing RequestVote RPCs
   node.setRequestVoteCallback(
-    [&stubs](int peer,
-             int term,
-             int candidateId,
-             int lastLogIndex,
-             int lastLogTerm) -> bool {
-      RequestVoteRequest req;
+    [&stubs](int peer, int term, int candidateId, int lastLogIndex, int lastLogTerm) {
+      RequestVoteArgs req;
       req.set_term(term);
       req.set_candidateid(candidateId);
       req.set_lastlogindex(lastLogIndex);
       req.set_lastlogterm(lastLogTerm);
-
       RequestVoteReply resp;
       grpc::ClientContext ctx;
-      auto status = stubs[peer]->RequestVote(&ctx, req, &resp);
-      if (!status.ok()) {
-        std::cerr << "RequestVote RPC to peer " << peer
-                  << " failed: " << status.error_message() << "\n";
-        return false;
-      }
-      return resp.votegranted();
+      return stubs[peer]->RequestVote(&ctx, req, &resp).ok()
+             && resp.votegranted();
     }
   );
 
-  // 4b) Wire up outgoing AppendEntries RPCs
   node.setAppendEntriesCallback(
-    [&stubs](int peer,
-             int term,
-             int leaderId,
-             int prevLogIndex,
-             int prevLogTerm,
+    [&stubs](int peer, int term, int leaderId,
+             int prevLogIndex, int prevLogTerm,
              const std::vector<LogEntry>& entries,
-             int leaderCommit) -> bool {
-      AppendEntriesRequest req;
+             int leaderCommit) {
+      AppendEntriesArgs req;
       req.set_term(term);
       req.set_leaderid(leaderId);
       req.set_prevlogindex(prevLogIndex);
@@ -162,24 +206,25 @@ int main(int argc, char** argv) {
         pe->set_command(e.command);
       }
       req.set_leadercommit(leaderCommit);
-
       AppendEntriesReply resp;
       grpc::ClientContext ctx;
-      auto status = stubs[peer]->AppendEntries(&ctx, req, &resp);
-      return status.ok() && resp.success();
+      return stubs[peer]->AppendEntries(&ctx, req, &resp).ok()
+             && resp.success();
     }
   );
 
-  // 5) Start Raft’s election timer (and, upon election, heartbeats)
   node.start();
 
-  // 6) Launch the gRPC server to accept incoming Raft RPCs
-  RaftServiceImpl service(node);
+  RaftServiceImpl raftSvc(node);
+  KVServiceImpl  kvSvc (node, kv);
+
   ServerBuilder builder;
   std::string listenAddr = "0.0.0.0:" + std::to_string(50050 + myId);
   builder.AddListeningPort(listenAddr, grpc::InsecureServerCredentials());
-  builder.RegisterService(&service);
-  std::unique_ptr<Server> server(builder.BuildAndStart());
+  builder.RegisterService(&raftSvc);
+  builder.RegisterService(&kvSvc);
+
+  auto server = builder.BuildAndStart();
   std::cout << "Node " << myId << " listening on " << listenAddr << "\n";
   server->Wait();
 
