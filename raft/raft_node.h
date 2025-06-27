@@ -4,11 +4,12 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <string>
 
 // Raft states
 enum class RaftState {Follower, Candidate, Leader};
 
-// A log entry: term and command
+// A log entry: term, index, and command
 struct LogEntry {
     int term;
     int index;
@@ -17,102 +18,99 @@ struct LogEntry {
 
 class RaftNode {
 public:
-    using RequestVoteFn =
-      std::function<bool(int peerId,
-                         int candidateTerm,
-                         int candidateId,
-                         int lastLogIndex,
-                         int lastLogTerm)>;
+    using RequestVoteFn = std::function<bool(int peerId,
+                                             int candidateTerm,
+                                             int candidateId,
+                                             int lastLogIndex,
+                                             int lastLogTerm)>;
 
-    using AppendEntriesFn =
-    std::function<bool(int peerId,
-                       int term,
-                       int leaderId,
-                       int prevLogIndex,
-                       int prevLogTerm,
-                       const std::vector<LogEntry>& entries,
-                       int leaderCommit)>;
-    
-    // callback to apply committed entries to the state machine
-    using ApplyFn =
-    std::function<void(const LogEntry& entry)>;
+    using AppendEntriesFn = std::function<bool(int peerId,
+                                               int term,
+                                               int leaderId,
+                                               int prevLogIndex,
+                                               int prevLogTerm,
+                                               const std::vector<LogEntry>& entries,
+                                               int leaderCommit)>;
 
+    using ApplyFn = std::function<void(const LogEntry& entry)>;
 
     RaftNode(int id, const std::vector<int>& peerIds);
     ~RaftNode();
 
-    // Start the node's main loop (election timer, heartbeats)
+    // Start/stop node threads
     void start();
     void shutdown();
 
-    // RPC handlers called by the network layer
-    bool handleRequestVote(int candidateTerm, int candidateId,
-                           int lastLogIndex, int lastLogTerm);
+    // Incoming RPC handlers
+    bool handleRequestVote(int candidateTerm,
+                           int candidateId,
+                           int lastLogIndex,
+                           int lastLogTerm);
 
-    bool handleAppendEntries(int leaderTerm, int leaderId,
-                             int prevLogIndex, int prevLogTerm,
+    bool handleAppendEntries(int leaderTerm,
+                             int leaderId,
+                             int prevLogIndex,
+                             int prevLogTerm,
                              const std::vector<LogEntry>& entries,
                              int leaderCommit);
 
-    // let the caller provide a function that actually sends a
-    // RequestVote RPC to peerId
+    // Configure outgoing RPC callbacks
     void setRequestVoteCallback(RequestVoteFn fn);
+    void setAppendEntriesCallback(AppendEntriesFn fn);
 
-    // Let caller provide the RPC stub for AppendEntries
-    void setAppendEntriesCallback(AppendEntriesFn fn) {
-      std::lock_guard<std::mutex> lock(mtx);
-      appendEntriesRpc = std::move(fn);
-    }
-
-    // register the apply‐entry callback
+    // Configure the state‐machine apply callback
     void setApplyCallback(ApplyFn fn);
 
-    // Thread-safe check for leader state
+    // Check whether this node believes itself to be the leader
     bool isLeader() const {
-      std::lock_guard<std::mutex> lock(mtx);
-      return state == RaftState::Leader;
+        std::lock_guard<std::mutex> lock(mtx);
+        return state == RaftState::Leader;
     }
 
-    // Thread-safe accessor for currentTerm
+    // Read current term
     int getCurrentTerm() const {
         std::lock_guard<std::mutex> lock(mtx);
         return currentTerm;
     }
 
+    // Client‐side: propose & wait for a command to replicate+commit
+    bool replicateCommand(const std::string& command, int timeout_ms = 1000);
 
 private:
-    mutable std::mutex mtx;
+    // Timer, election, replication internals
     void runElectionTimer();
+    void startElection();
     void sendHeartbeats();
     void becomeLeader();
     void becomeFollower(int term);
     void replicateLog();
-    // Election logic
-    void startElection();
+
+    // Node identity & cluster
     int nodeId;
     std::vector<int> peers;
     RaftState state;
 
+    // Persistent log & indices
     std::vector<LogEntry> log;
     int currentTerm;
     int votedFor;
     int commitIndex;
     int lastApplied;
 
-    // holds the user‐supplied RPC stub
-    RequestVoteFn requestVoteRpc;
-
-    // add a member to hold the callback:
+    // RPC callbacks
+    RequestVoteFn    requestVoteRpc;
     AppendEntriesFn appendEntriesRpc;
+    ApplyFn          applyCb;
 
-    // user‐supplied apply‐callback
-    ApplyFn applyCb;
+    // For waiting on commits
+    std::condition_variable commitCv;
 
-    // Election timeout and heartbeat interval
+    // Timing parameters
     std::chrono::milliseconds electionTimeout;
     std::chrono::milliseconds heartbeatInterval;
 
-    // std::mutex mtx;
+    // Synchronization
+    mutable std::mutex mtx;
     std::condition_variable cv;
     bool running;
 };

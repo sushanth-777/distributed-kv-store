@@ -16,14 +16,14 @@ using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::Status;
 
-// Consensus RPCs (all defined in kv.proto under package kv)
+// Raft RPCs
 using kv::Raft;
 using kv::RequestVoteArgs;
 using kv::RequestVoteReply;
 using kv::AppendEntriesArgs;
 using kv::AppendEntriesReply;
 
-// Client-facing KV RPCs (defined in the same kv.proto)
+// KV RPCs
 using kv::KV;
 using kv::PutRequest;
 using kv::PutReply;
@@ -56,12 +56,10 @@ public:
   Status AppendEntries(ServerContext* /*ctx*/,
                        const AppendEntriesArgs* req,
                        AppendEntriesReply* resp) override {
-    // Convert each protobuf LogEntry → our internal LogEntry
     std::vector<LogEntry> entries;
     entries.reserve(req->entries_size());
     for (int i = 0; i < req->entries_size(); ++i) {
       const auto& e = req->entries(i);
-      // <-- explicit LogEntry construction fixes the push_back error:
       entries.push_back({
         static_cast<int>(e.term()),
         static_cast<int>(e.index()),
@@ -87,7 +85,7 @@ private:
 };
 
 // ------------------------------------
-// KVServiceImpl: handles client requests
+// KVServiceImpl: handles client KV RPCs
 // ------------------------------------
 class KVServiceImpl final : public KV::Service {
 public:
@@ -97,13 +95,16 @@ public:
   Status Put(ServerContext* /*ctx*/,
              const PutRequest* req,
              PutReply* resp) override {
-    // Only the leader accepts writes
+    // Only leader may accept writes
     if (!node_.isLeader()) {
       resp->set_success(false);
       return Status::OK;
     }
-    kv_.put(req->key(), req->value());
-    resp->set_success(true);
+
+    // Build Raft command and replicate
+    std::string cmd = "put " + req->key() + " " + req->value();
+    bool committed = node_.replicateCommand(cmd, /*timeout_ms=*/1000);
+    resp->set_success(committed);
     return Status::OK;
   }
 
@@ -123,8 +124,10 @@ public:
       resp->set_success(false);
       return Status::OK;
     }
-    kv_.del(req->key());
-    resp->set_success(true);
+
+    std::string cmd = "del " + req->key();
+    bool committed = node_.replicateCommand(cmd, /*timeout_ms=*/1000);
+    resp->set_success(committed);
     return Status::OK;
   }
 
@@ -153,9 +156,11 @@ int main(int argc, char** argv) {
     peerAddrs.push_back(spec.substr(colon + 1));
   }
 
+  // 1) Build RaftNode + KVStore
   RaftNode node(myId, peerIds);
   KVStore kv;
 
+  // 2) Apply callback: commit → mutate KV
   node.setApplyCallback([&kv](const LogEntry& entry) {
     std::istringstream iss(entry.command);
     std::string op, key, val;
@@ -167,6 +172,7 @@ int main(int argc, char** argv) {
     }
   });
 
+  // 3) Build peer stubs & wire RPC callbacks
   std::unordered_map<int, std::unique_ptr<Raft::Stub>> stubs;
   for (size_t i = 0; i < peerIds.size(); ++i) {
     stubs[peerIds[i]] = Raft::NewStub(
@@ -176,7 +182,8 @@ int main(int argc, char** argv) {
   }
 
   node.setRequestVoteCallback(
-    [&stubs](int peer, int term, int candidateId, int lastLogIndex, int lastLogTerm) {
+    [&stubs](int peer, int term, int candidateId,
+             int lastLogIndex, int lastLogTerm) {
       RequestVoteArgs req;
       req.set_term(term);
       req.set_candidateid(candidateId);
@@ -199,7 +206,7 @@ int main(int argc, char** argv) {
       req.set_leaderid(leaderId);
       req.set_prevlogindex(prevLogIndex);
       req.set_prevlogterm(prevLogTerm);
-      for (const auto& e : entries) {
+      for (auto& e : entries) {
         auto* pe = req.add_entries();
         pe->set_term(e.term);
         pe->set_index(e.index);
@@ -213,8 +220,10 @@ int main(int argc, char** argv) {
     }
   );
 
+  // 4) Start Raft
   node.start();
 
+  // 5) Launch gRPC server
   RaftServiceImpl raftSvc(node);
   KVServiceImpl  kvSvc (node, kv);
 
@@ -227,6 +236,4 @@ int main(int argc, char** argv) {
   auto server = builder.BuildAndStart();
   std::cout << "Node " << myId << " listening on " << listenAddr << "\n";
   server->Wait();
-
-  return 0;
 }
